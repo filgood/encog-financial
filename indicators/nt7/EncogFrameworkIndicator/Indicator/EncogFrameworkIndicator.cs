@@ -34,6 +34,8 @@ using System.Text;
 using System.Threading;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Windows.Forms;
+using System.Globalization;
 using NinjaTrader.Cbi;
 using NinjaTrader.Data;
 using NinjaTrader.Gui.Chart;
@@ -52,34 +54,98 @@ namespace NinjaTrader.Indicator
         // Wizard generated variables
             private string indicatorName = @"default"; // Default setting for Name
             private string host = @"localhost"; // Default setting for Host
-            private int port = 1; // Default setting for Port
+            private int port = 5128; // Default setting for Port
         // User defined variables (add any user defined variables below)
 		public const int TIMEOUT = 20000;	
 		
+		/// <summary>
+		/// The indicator is stateful, and can be in the following states.
+		/// </summary>
 		private enum IndicatorState 
 		{
+			/// <summary>
+			/// The indicator has not yet connected.
+			/// </summary>
 			Uninitialized,
+			/// <summary>
+			/// The indicator has connected and is ready for use.
+			/// Also indicates that the indicator is not blocking
+			/// and waiting for a bar.
+			/// </summary>
 			Ready,
+			/// <summary>
+			/// The indicator has sent a bar, and is now waiting on
+			/// a response from Encog.
+			/// </summary>
 			SentBar,
+			/// <summary>
+			/// An error has occured.  The indicator is useless at 
+			/// this point and will perform no further action.
+			/// </summary>
 			Error
 		}
-					
-		private Socket sock;
-		private IList<string> sourceData;
-		private bool blockingMode = false;
-		private string lastPacket;
+		
+		/// <summary>
+        /// The socket that we are using to communicate.
+        /// </summary>
+		private Socket _sock;
+		
+		/// <summary>
+		/// The source data requested, for example HIGH, LOW, etc, as well as 
+		/// 3rd party indicators.
+		/// </summary>
+		private IList<string> _sourceData;
+		
+		/// <summary>
+		/// Are we in blocking mode?  If we are just downloading data, then probably not
+		/// in blocking mode.  If we are going to actually display indicator data then we
+		/// are in blocking mode.  Blocking mode requres a "bar" response from Encog for
+		/// each bar.  Non-blocking mode can simply "stream".
+		/// </summary>
+		private bool _blockingMode = false;
+		
+		/// <summary>
+		/// The state of the indicator.  
+		/// </summary>
 		private IndicatorState _indicatorState = IndicatorState.Uninitialized;
-		private double[] _indicatorData = new double[3];
+				
+		/// <summary>
+		/// The output data from Encog to diplay as the indicator.
+		/// </summary>		
+		private double[] _indicatorData = new double[8];
+		
+		/// <summary>
+		/// Error text that should be displayed if we are in an error state.
+		/// </summary>
+		private string _errorText;
+		
+		/// <summary>
+		/// Do not change this.  The "wire protocol" uses USA format numbers.
+		/// This does not affect display.
+		/// </summary>
+		private readonly CultureInfo _cultureUSA = new CultureInfo("en-US");
 
         #endregion
 		
 		#region Socket
+		
+		/// <summary>
+		/// Send data to the remote socket, if we are connected.
+		/// If we are not connected, ignore. Data is sent in ASCII.
+		/// </summary>
+		/// <param name="str">The data to send to the remote.</param>
 		protected void Send(String str)
         {
-            byte[] msg = Encoding.ASCII.GetBytes(str+"\n");
-            sock.Send(msg);
+			if( _sock!=null )
+			{
+            	byte[] msg = Encoding.ASCII.GetBytes(str+"\n");
+            	_sock.Send(msg);
+			}
         }
 		
+		/// <summary>
+		/// Open a connection to Encog. Also send the HELLO packet.
+		/// </summary>
 		protected void OpenConnection()
 		{
 			try
@@ -87,6 +153,7 @@ namespace NinjaTrader.Indicator
                 IPAddress[] ips = Dns.GetHostAddresses(host);
                 IPAddress targetIP = null;
 				
+				// first we need to resolve the host name to an IP address
 				foreach( IPAddress ip in ips )
 				{
 					if( ip.AddressFamily == AddressFamily.InterNetwork )
@@ -96,42 +163,55 @@ namespace NinjaTrader.Indicator
 					}
 				}
 				
+				// if successful, then connect to the remote and send the HELLO packet.
 				if( targetIP!=null )
 				{
 					IPEndPoint endPoint = new IPEndPoint(targetIP,port);
-	                sock = new Socket(targetIP.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
-    	            sock.Connect(endPoint);
+	                _sock = new Socket(targetIP.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+    	            _sock.Connect(endPoint);
         	        Send("\"HELLO\",\"NinjaTrader 7\",\""+indicatorName+"\"");
 				}
 				else
 				{
-					Log("Failed to resolve: " + host,LogLevel.Error);
-					_indicatorState = IndicatorState.Error;
+					// report failure and exit
+					PerformError("Failed to resolve: " + host);
 					return;
 				}
 				
-				sock.ReceiveTimeout = TIMEOUT;
+				// make sure the socket will timeout
+				_sock.ReceiveTimeout = TIMEOUT;
 				
 				while( _indicatorState != IndicatorState.Ready && _indicatorState != IndicatorState.Error )
 				{
 					WaitForPacket();
-				}
-								
-				//Log("Timed out waiting for signals packet",LogLevel.Error);								
+				}							
             }
             catch (Exception ex)
             {
-				Log("Encog: Exception: " + ex.ToString(), LogLevel.Error);
+				_sock = null;
+				PerformError(ex.Message);
             }
 		}
 		#endregion
 		
 		#region Parse
+		
+		/// <summary>
+		/// Parse a line of CSV.  Lines can have quote escaped text.
+		/// A quote inside a string should be HTML escaped (i.e. &quot;)
+		/// Only &quot; is supported, and it must be lower case.
+		/// 
+		/// Ideally, I would like to use HttpUtility, however, in .Net
+		/// 3.5, used by NT, this requires an additonal reference, 
+		/// which is an extra step in the setup process.
+		/// </summary>
+		/// <param name="line">The line to parse.</param>
+		/// <returns>A list of values.</returns>
 		protected IList<string> ParseCSV(string line)
-        {
-            bool quote = false;
+        {					
+            var quote = false;
             var temp = new StringBuilder();
-            var result = new List<string>();
+            var result = new List<string>();			
 
             foreach(char ch in line)
             {
@@ -141,7 +221,7 @@ namespace NinjaTrader.Indicator
                 }
                 else if( ch==',' && !quote )
                 {
-                    result.Add(temp.ToString());
+                    result.Add(temp.ToString().Replace("&quot;","\""));
                     temp.Length = 0;
                     quote = false;
                 }
@@ -151,58 +231,34 @@ namespace NinjaTrader.Indicator
                 }
             }
 
-            result.Add(temp.ToString());
+            result.Add(temp.ToString().Replace("&quot;","\""));
             return result;
         }
 		
-		protected IList<string> ParseParams(string str)
-		{
-			var current = new StringBuilder();
-			var result = new List<string>();
-			bool quote = false;
-			
-			foreach(char ch in str)
-			{
-				if( ch==',' && !quote )
-				{
-					result.Add(current.ToString().Trim());
-					current.Length = 0;
-				}
-				else if( ch=='\"' )
-				{
-					quote = !quote;
-				}
-				else 
-				{
-					current.Append(ch);
-				}
-			}
-			
-			if( current.ToString().Trim().Length>0 )
-			{
-				result.Add(current.ToString().Trim());
-			}
-			
-			return result;
-		}
-		
+		/// <summary>
+		/// Parse an array size, for example "avg[5]".  Return both the
+		/// number, and the name before the brakets.
+		/// </summary>
+		/// <param name="str">The string to parse.</param>
+		/// <param name="index">The index parsed.</param>
+		/// <param name="name">The name parsed.</param>
 		private void ParseArraySize(string str, ref int index, ref string name)
 		{
-			int idx = str.IndexOf('[');
+			var idx = str.IndexOf('[');
 					
 			if( idx==-1 )
 			{
 				return;
 			}
 						
-			int idx2 = str.IndexOf(']',idx);
+			var idx2 = str.IndexOf(']',idx);
 						
 			if( idx2==-1 )
 			{
 				return;
 			}
 			
-			string s = str.Substring(idx+1,idx2-idx-1);
+			var s = str.Substring(idx+1,idx2-idx-1);
 			index = int.Parse(s);
 			name = str.Substring(0,idx).Trim();
 		}
@@ -210,29 +266,40 @@ namespace NinjaTrader.Indicator
 		#endregion
 		
 		#region Packets
+		
+		/// <summary>
+		/// Wait for a packet.  Timeout if necessary.
+		/// </summary>
 		public void WaitForPacket() {
-			StringBuilder line = new StringBuilder();			
-			byte[] buffer = new byte[1024];
-			char[] charBuffer = new char[1024];						
-			int actualSize = 0;
-				
+			var line = new StringBuilder();			
+			var buffer = new byte[1024];
+			var charBuffer = new char[1024];						
+			var actualSize = 0;
+			
+			// if there was an error, nothing to wait for.
+			if( this._indicatorState == IndicatorState.Error )
+			{
+				return;				
+			}
+			
+			// attempt to get a packet
 			try
 			{
-				actualSize = this.sock.Receive(buffer);
+				actualSize = _sock.Receive(buffer);
 			}
 			catch(SocketException ex)
 			{
-				actualSize = 0;
-				if( ex.ErrorCode !=10060 && ex.ErrorCode!=10035 ) 
-				{
-					Log("Socket Error: " + ex.ToString(), LogLevel.Error);											
-				}
+				PerformError("Socket Error: " + ex.ToString());
+				return;
 			}
 				
+			// If we got a packet, then process it.
 			if( actualSize>0 ) {					
+				// packets are in ASCII
 				ASCIIEncoding ascii = new ASCIIEncoding();
 				ascii.GetChars(buffer,0,actualSize,charBuffer,0);
 					
+				// Break up the packets, they are ASCII lines.
 				for(int i=0;i<actualSize;i++) 
 				{
 					char ch = (char)charBuffer[i];
@@ -253,55 +320,113 @@ namespace NinjaTrader.Indicator
 			}
 		}
 		
+		/// <summary>
+		/// Handle an error.  Display the error to the user, log it,
+		/// and set the state to error.  No further processing on this
+		/// indicator will occur.
+		/// </summary>
+		/// <param name="whatError">The error text.</param>
+		protected void PerformError(string whatError)
+		{
+			try
+			{
+				_indicatorState = IndicatorState.Error;
+				_errorText = whatError;
+				Log("Encog Error: " + whatError ,LogLevel.Error);
+				Log("Encog: Shutting down socket", LogLevel.Information);
+				Send("\"GOODBYE\"");			
+				_sock.Close();
+				_sock = null;
+			}
+			finally
+			{				
+				DrawError();
+			}
+		}
+		
+		/// <summary>
+		/// Tell the remote that we are about to disconnect.
+		/// </summary>
 		protected void PerformGoodBye()
 		{
 			try
 			{
 				Log("Shutting down socket", LogLevel.Information);
 				Send("\"GOODBYE\"");			
-				sock.Close();
-				sock = null;
+				_sock.Close();
+				_sock = null;
 			}
 			finally
-			{
+			{				
 				_indicatorState = IndicatorState.Uninitialized;
 			}
 		}
 		
+		/// <summary>
+		/// Process a packet.
+		/// </summary>
+		/// <param name="line">The packet line.</param>
 		protected void GotPacket(String line) {			
-			Log("Encog: Input packet: " + line + ",len=" + line.Length,LogLevel.Information );
-			IList<string> list = ParseCSV(line);
-			IList<string> temp = new List<string>();
+			var list = ParseCSV(line);
+			var temp = new List<string>();
 			
+			// a SIGNALS packet tells us what indicators and fund data the remote wants.
 			if( string.Compare(list[0],"signals",true)==0 )
 			{				
-				sourceData = new List<string>();
+				_sourceData = new List<string>();
 				for(int i=1;i<list.Count;i++)
 				{
-					sourceData.Add(list[i]);
+					_sourceData.Add(list[i]);
 				}
 
 			}
+			// The INIT packet tells us what protocol version we are using, 
+			// and if blocking mode is requested.
 			else if ( string.Compare(list[0],"init",true)==0 )
 			{
-				blockingMode = list[1].Trim()=="1";
+				_blockingMode = list[1].Trim()=="1";
 				_indicatorState = IndicatorState.Ready;
-				Log("Encog: Blocking mode: " + blockingMode, LogLevel.Information );				
+				Log("Encog: Blocking mode: " + _blockingMode, LogLevel.Information );				
 			}
+			// The ERROR packet allows the server to put us into an error state and
+			// provide a string that tells the reason.
 			else if ( string.Compare(list[0],"error",true)==0 )
 			{
-				Log("Encog Error: " + list[1], LogLevel.Error);
-				_indicatorState = IndicatorState.Error;
+				PerformError("Server Error: " + list[1]);
 			}
+			// The WARNING packet allows the server to log a warning.
 			else if ( string.Compare(list[0],"warning",true)==0 )
 			{
 				Log("Encog Warning: " + list[1],LogLevel.Warning);
 			}
+			// The IND packet provides indicator data, to be displayed.  Only used
+			// when in blocking mode.
 			else if ( string.Compare(list[0],"ind",true)==0 )
 			{
-				for(int i=0;i<3;i++)
+				if( list.Count != 9 )
 				{
-					_indicatorData[i] = double.Parse(list[i+1]);
+					PerformError("Not enough indicator values from Encog, must have 8, had:" + (list.Count-1));
+					return;
+				}
+						
+				try
+				{
+					for(int i=0;i<8;i++)
+					{
+						if( "?".Equals(list[i+1]) )
+						{
+							_indicatorData[i] = double.NaN;
+						}
+						else
+						{
+							//_indicatorData[i] = double.Parse(list[i+1]);
+							_indicatorData[i] = double.Parse(list[i+1],_cultureUSA);
+						}
+					}
+				}
+				catch(FormatException ex)
+				{
+					PerformError(ex.Message);
 				}
 				_indicatorState = IndicatorState.Ready;
 			}
@@ -311,11 +436,19 @@ namespace NinjaTrader.Indicator
 		#endregion
 		
 		#region Evaluate
+		
+		/// <summary>
+		/// Fill the parameters of a 3rd party indicator.
+		/// </summary>
+		/// <param name="targetMethod">The name of the indicator( i.e. "MACD(12,26,9)")</param>
+		/// <param name="paramList">The parameter list.</param>
+		/// <returns>The objects</returns>
 		protected object[] FillParams(MethodInfo targetMethod, IList<string> paramList)
 		{
 			ParameterInfo[] pi = targetMethod.GetParameters();
 			object[] result = new Object[paramList.Count];
 			
+			// loop over the parameters and create objects of the correct type.
 			for(int i=0;i<paramList.Count;i++)
 			{
 				string v = paramList[i];
@@ -338,6 +471,24 @@ namespace NinjaTrader.Indicator
 			return result;
 		}
 		
+		/// <summary>
+		/// Evaluate a custom indicator. These indicators must be in the form:
+		/// 
+		/// INDICATOR.VALUE[BARS_NEEDED]
+		/// 
+		/// For example, 
+		/// 
+		/// MACD(12,26,9).Avg[1]
+		/// 
+		/// This would request the current BAR of the Avg value of the MACD indicator.
+		/// If the indicator has only one value, then the following format is used.
+		/// 
+		/// EMA(14)[1]
+		/// 
+		/// This would request the current bar of EMA, with a period of 14.
+		/// </summary>
+		/// <param name="str">The indicator string.</param>
+		/// <returns></returns>
 		protected IDataSeries Eval(string str)
 		{
 			IList<string> indicatorParams = new List<string>();			
@@ -346,13 +497,13 @@ namespace NinjaTrader.Indicator
 			try
 			{				
 				// first extract the indicator name
-				int index = str.IndexOf('(');
+				var index = str.IndexOf('(');
 				if( index == -1 )
 				{
 					index = str.Length;	
 				}
 			
-				string indicatorName = str.Substring(0,index).Trim();
+				var indicatorName = str.Substring(0,index).Trim();
 			
 				// now extract params
 				index = str.IndexOf('(',index);
@@ -362,12 +513,13 @@ namespace NinjaTrader.Indicator
 					index2 = str.IndexOf(')');
 					if( index2!=-1) 
 					{
-						string s = str.Substring(index+1,index2-index-1).Trim();
-						indicatorParams = ParseParams(s);
+						var s = str.Substring(index+1,index2-index-1).Trim();
+						indicatorParams = ParseCSV(s);
 					}
 					else 
 					{
-						// error
+						PerformError("Invalid custom indicator: " + str);
+						return null;
 					}
 				
 					index = index2+1;				
@@ -387,7 +539,8 @@ namespace NinjaTrader.Indicator
 			
 				// determine if there is a property name
 				string propertyName;
-				int p = str.IndexOf('.',index);
+				var p = str.IndexOf('.',index);
+				
 				if( p!=-1 )
 				{
 					index = p+1;
@@ -413,20 +566,48 @@ namespace NinjaTrader.Indicator
 				// execute indicator
 				var rawParams = FillParams(targetMethod,indicatorParams);						
 				object rtn = targetMethod.Invoke(this,rawParams);
-				PropertyInfo pi = rtn.GetType().GetProperty(propertyName);
+				
+				if( rtn==null )
+				{
+					PerformError("Custom indicator returned null: " + str);
+					return null;
+				}
+				
+				var pi = rtn.GetType().GetProperty(propertyName);
+				
+				if( pi==null )
+				{
+					PerformError("Custom indicator property not found: " + str);
+					return null;
+				}
+				
 				IDataSeries ds = (IDataSeries)pi.GetValue(rtn,null);
 				
 				return ds;				
 			}
 			catch(Exception ex)
 			{
-				Log("Eval Error: " + ex.InnerException.ToString(),LogLevel.Error);
-				return null;
+				PerformError("Eval Error: " + ex.InnerException.ToString());
 			}
+			
+			return null;
 		}		
 		
 		#endregion
 
+		#region GeneralUtil
+		void DrawError() 
+		{						
+			if( this.ChartControl !=null && _errorText !=null )
+			{
+				bool hold = this.DrawOnPricePanel;				
+				this.DrawOnPricePanel = false;
+				this.DrawTextFixed("error msg", "ERROR:" + _errorText, TextPosition.Center);
+				this.DrawOnPricePanel = hold;
+			}
+		}
+		
+		#endregion
 		
         /// <summary>
         /// This method is used to configure the indicator and is called once before any bar data is loaded.
@@ -448,6 +629,8 @@ namespace NinjaTrader.Indicator
 			Add(new Line(Color.FromKnownColor(KnownColor.Khaki), 0, "Osc2"));
 			Add(new Line(Color.FromKnownColor(KnownColor.CadetBlue), 0, "Osc3"));
             Overlay				= false;
+			
+			Console.WriteLine("Init");
         }
 
         /// <summary>
@@ -455,17 +638,23 @@ namespace NinjaTrader.Indicator
         /// </summary>
         protected override void OnBarUpdate()
         {	
-			if( _indicatorState == IndicatorState.Error )
-			{
-				return;
-			}
-			
+			// Try to connect, if we are not yet connected.
+			// We do this here so that we do not connect everytime the indicator is instanciated.
+			// Indicators are often instanciated several times before they are actually used.
 			if( _indicatorState == IndicatorState.Uninitialized )
 			{				
 				OpenConnection();
 			}
 			
-			if( sock!=null )
+			// Are we in an error state?  If so, display and exit.
+			if( _indicatorState == IndicatorState.Error )
+			{				
+				DrawError();
+				return;
+			}
+												
+			// If we are actually connected to a socket, then communicate with it.
+			if( _sock!=null )
 			{
 				StringBuilder line = new StringBuilder();
 
@@ -482,7 +671,7 @@ namespace NinjaTrader.Indicator
 				line.Append(this.Instrument.FullName);
 				line.Append("\"");
 				
-				foreach(string name in this.sourceData)
+				foreach(string name in _sourceData)
 				{
 					IDataSeries source;
 					int totalBars = 1;
@@ -510,13 +699,21 @@ namespace NinjaTrader.Indicator
 					{
 						source = Volume;
 					}					
+					else if( string.Compare(name2,"THIS", true) == 0 )
+					{
+						source = Values[0];
+					}
 					else 
 					{
 						source = Eval(name2);
+						if( source==null )
+						{
+							return;
+						}
 					}
 					
 					// now copy needed data
-					int cnt = CurrentBar + 1;
+					var cnt = CurrentBar + 1;
 					
 					for(int i=0;i<totalBars;i++) 
 					{						
@@ -524,34 +721,80 @@ namespace NinjaTrader.Indicator
 
 						if( i>=cnt )
 						{
-							//MessageBox.Show(i + ":?");
 							line.Append("?");
 						}
 						else 
-						{	
-							//MessageBox.Show(i + ":" + source[i]);
-							line.Append(source[i]);
+						{								
+							//line.Append(Convert.ToString(source[i]));
+							line.Append(Convert.ToString(source[i],_cultureUSA));
 						}
 					}
 				}
 				
 				Send(line.ToString());
 				
-				if( blockingMode )
+				// if we are expecting data back from the socket, then wait for it.
+				if( _blockingMode )
 				{
+					// we are now waiting for a bar
 					_indicatorState = IndicatorState.SentBar;
 					while( _indicatorState != IndicatorState.Error && _indicatorState!=IndicatorState.Ready )
 					{
 						WaitForPacket();
 					}
 					
+					// we got a bar message, then display it
 					if( _indicatorState == IndicatorState.Ready )
-					{
-						Plot1.Set(_indicatorData[0]);
-            			Plot2.Set(_indicatorData[1]);
+					{	
+						if( !double.IsNaN(_indicatorData[0]) )
+						{
+							Plot1.Set(_indicatorData[0]);
+						}
+						
+						if( !double.IsNaN(_indicatorData[1]) )
+						{
+            				Plot2.Set(_indicatorData[1]);
+						}
+							
+						if( !double.IsNaN(_indicatorData[2]) )
+						{
+							Plot3.Set(_indicatorData[2]);
+						}
+							
+						if( !double.IsNaN(_indicatorData[3]) )
+						{
+							Bar1.Set(_indicatorData[3]);
+						}
+							
+						if( !double.IsNaN(_indicatorData[4]) )
+						{
+            				Bar2.Set(_indicatorData[4]);
+						}
+							
+						if( !double.IsNaN(_indicatorData[5]) )
+						{
+							Bar3.Set(_indicatorData[5]);
+						}
+							
+						if( !double.IsNaN(_indicatorData[6]) )
+						{
+							IndSell.Set(_indicatorData[6]);
+						}
+							
+						if( !double.IsNaN(_indicatorData[7]) )
+						{	
+            				IndBuy.Set(_indicatorData[7]);
+						}
 					}
-				}				
-			}			
+				}
+				else 
+				{
+					var hold = this.DrawOnPricePanel;				
+					DrawOnPricePanel = false;
+					DrawTextFixed("general msg","This indicator only sends data, so there is no display.",TextPosition.Center);
+					DrawOnPricePanel = hold;					
+				}
+			}
         }	
 
 		/// <summary>
@@ -559,7 +802,7 @@ namespace NinjaTrader.Indicator
         /// </summary>
 		protected override void OnTermination() 
 		{
-			if(sock!=null) 
+			if(_sock!=null) 
 			{				
 				Log("OnTermination called, shutting down connection.",LogLevel.Information);
 				PerformGoodBye();
