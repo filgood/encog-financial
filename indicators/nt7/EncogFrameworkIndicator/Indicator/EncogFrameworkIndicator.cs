@@ -180,8 +180,9 @@ namespace NinjaTrader.Indicator
 				
 				// make sure the socket will timeout
 				_sock.ReceiveTimeout = TIMEOUT;
+				_indicatorState = IndicatorState.Uninitialized;
 				
-				while( _indicatorState != IndicatorState.Ready && _indicatorState != IndicatorState.Error )
+				while( _indicatorState == IndicatorState.Uninitialized )
 				{
 					WaitForPacket();
 				}							
@@ -260,12 +261,58 @@ namespace NinjaTrader.Indicator
 			
 			var s = str.Substring(idx+1,idx2-idx-1);
 			index = int.Parse(s);
+			
+			if( index<1 ) 
+			{
+				index = 1;
+			}
+			
 			name = str.Substring(0,idx).Trim();
 		}
 				
 		#endregion
 		
 		#region Packets
+		
+		/// <summary>
+		/// The HELLO packet, sent from the client to the server to provide version information.
+		/// </summary>
+		public const string PACKET_HELLO = "HELLO";
+	
+		/// <summary>
+		/// The GOODBYE packet, sent from the client to the server to end communication.
+		/// </summary>
+		public const string PACKET_GOODBYE = "GOODBYE";
+	
+		/// <summary>
+		/// The SIGNALS packet, sent from the client to the server to specify requested data.
+		/// </summary>
+		public const string PACKET_SIGNALS = "SIGNALS";
+	
+		/// <summary>
+		/// The INIT packet, sent from the server to the client to provide config information.
+		/// </summary>
+		public const string PACKET_INIT = "INIT";
+	
+		/// <summary>
+		/// The BAR packet, sent from the client to the server at the end of each BAR.
+		/// </summary>
+		public const string PACKET_BAR = "BAR";
+	
+		/// <summary>
+		/// The IND packet, sent from the server to the clinet, in response to a BAR. 
+		/// </summary>
+		public const string PACKET_IND = "IND";
+		
+		/// <summary>
+		/// The ERROR packet, used to move to an error state.
+		/// </summary>
+		public const String PACKET_ERROR = "ERROR";
+	
+		/// <summary>
+		/// The WARNING packet, used to log a warning.
+		/// </summary>
+		public const String PACKET_WARNING = "WARNING";
 		
 		/// <summary>
 		/// Wait for a packet.  Timeout if necessary.
@@ -289,7 +336,7 @@ namespace NinjaTrader.Indicator
 			}
 			catch(SocketException ex)
 			{
-				PerformError("Socket Error: " + ex.ToString());
+				PerformError("Socket Error: " + ex.Message);
 				return;
 			}
 				
@@ -334,7 +381,7 @@ namespace NinjaTrader.Indicator
 				_errorText = whatError;
 				Log("Encog Error: " + whatError ,LogLevel.Error);
 				Log("Encog: Shutting down socket", LogLevel.Information);
-				Send("\"GOODBYE\"");			
+				Send("\""+PACKET_GOODBYE+"\"");			
 				_sock.Close();
 				_sock = null;
 			}
@@ -352,7 +399,7 @@ namespace NinjaTrader.Indicator
 			try
 			{
 				Log("Shutting down socket", LogLevel.Information);
-				Send("\"GOODBYE\"");			
+				Send("\""+PACKET_GOODBYE+"\"");			
 				_sock.Close();
 				_sock = null;
 			}
@@ -370,8 +417,10 @@ namespace NinjaTrader.Indicator
 			var list = ParseCSV(line);
 			var temp = new List<string>();
 			
+			list[0] = list[0].ToUpper();
+			
 			// a SIGNALS packet tells us what indicators and fund data the remote wants.
-			if( string.Compare(list[0],"signals",true)==0 )
+			if( string.Compare(list[0],PACKET_SIGNALS,true)==0 )
 			{				
 				_sourceData = new List<string>();
 				for(int i=1;i<list.Count;i++)
@@ -382,7 +431,7 @@ namespace NinjaTrader.Indicator
 			}
 			// The INIT packet tells us what protocol version we are using, 
 			// and if blocking mode is requested.
-			else if ( string.Compare(list[0],"init",true)==0 )
+			else if ( string.Compare(list[0],PACKET_INIT,true)==0 )
 			{
 				_blockingMode = list[1].Trim()=="1";
 				_indicatorState = IndicatorState.Ready;
@@ -390,18 +439,18 @@ namespace NinjaTrader.Indicator
 			}
 			// The ERROR packet allows the server to put us into an error state and
 			// provide a string that tells the reason.
-			else if ( string.Compare(list[0],"error",true)==0 )
+			else if ( string.Compare(list[0],PACKET_ERROR,true)==0 )
 			{
 				PerformError("Server Error: " + list[1]);
 			}
 			// The WARNING packet allows the server to log a warning.
-			else if ( string.Compare(list[0],"warning",true)==0 )
+			else if ( string.Compare(list[0],PACKET_WARNING,true)==0 )
 			{
 				Log("Encog Warning: " + list[1],LogLevel.Warning);
 			}
 			// The IND packet provides indicator data, to be displayed.  Only used
 			// when in blocking mode.
-			else if ( string.Compare(list[0],"ind",true)==0 )
+			else if ( string.Compare(list[0],PACKET_IND,true)==0 )
 			{
 				if( list.Count != 9 )
 				{
@@ -665,7 +714,7 @@ namespace NinjaTrader.Indicator
 					Time[0].Month *  100000000l +
 					Time[0].Year *   10000000000l;
 				
-				line.Append("\"BAR\",");				
+				line.Append("\""+PACKET_BAR+"\",");				
 				line.Append(when);
 				line.Append(",\"");
 				line.Append(this.Instrument.FullName);
