@@ -169,7 +169,7 @@ namespace NinjaTrader.Indicator
 					IPEndPoint endPoint = new IPEndPoint(targetIP,port);
 	                _sock = new Socket(targetIP.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
     	            _sock.Connect(endPoint);
-        	        Send("\"HELLO\",\"NinjaTrader 7\",\""+indicatorName+"\"");
+        	        Send("\""+PACKET_HELLO+"\",\"NinjaTrader 7\",\""+indicatorName+"\"");
 				}
 				else
 				{
@@ -398,7 +398,7 @@ namespace NinjaTrader.Indicator
 		{
 			try
 			{
-				Log("Shutting down socket", LogLevel.Information);
+				Log("Encog: Shutting down socket", LogLevel.Information);
 				Send("\""+PACKET_GOODBYE+"\"");			
 				_sock.Close();
 				_sock = null;
@@ -607,7 +607,7 @@ namespace NinjaTrader.Indicator
 				}
 				else
 				{
-					propertyName = "Values";
+					propertyName = "Value";
 				}
 							
 				propertyName = propertyName.Trim();
@@ -628,7 +628,7 @@ namespace NinjaTrader.Indicator
 				{
 					PerformError("Custom indicator property not found: " + str);
 					return null;
-				}
+				}							
 				
 				IDataSeries ds = (IDataSeries)pi.GetValue(rtn,null);
 				
@@ -636,7 +636,15 @@ namespace NinjaTrader.Indicator
 			}
 			catch(Exception ex)
 			{
-				PerformError("Eval Error: " + ex.InnerException.ToString());
+				if( ex.InnerException==null )
+				{
+					PerformError("Eval Error: " + ex.Message);
+				}
+				else
+				{
+					PerformError("Eval Error: " + ex.InnerException.Message);
+				}
+				
 			}
 			
 			return null;
@@ -666,10 +674,10 @@ namespace NinjaTrader.Indicator
             Add(new Plot(Color.FromKnownColor(KnownColor.Orange), PlotStyle.Line, "Plot1"));
             Add(new Plot(Color.FromKnownColor(KnownColor.Red), PlotStyle.Line, "Plot2"));
 			Add(new Plot(Color.FromKnownColor(KnownColor.Green), PlotStyle.Line, "Plot3"));
-			
-			Add(new Plot(Color.FromKnownColor(KnownColor.Orange), PlotStyle.Line, "Bar1"));
-            Add(new Plot(Color.FromKnownColor(KnownColor.Red), PlotStyle.Line, "Bar2"));
-			Add(new Plot(Color.FromKnownColor(KnownColor.Green), PlotStyle.Line, "Bar3"));
+
+			Add(new Plot(Color.FromKnownColor(KnownColor.Orange), PlotStyle.Bar, "Bar1"));
+            Add(new Plot(Color.FromKnownColor(KnownColor.Red), PlotStyle.Bar, "Bar2"));
+			Add(new Plot(Color.FromKnownColor(KnownColor.Green), PlotStyle.Bar, "Bar3"));
 			
             Add(new Plot(Color.FromKnownColor(KnownColor.Firebrick), PlotStyle.TriangleDown, "IndSell"));
             Add(new Plot(Color.FromKnownColor(KnownColor.Green), PlotStyle.TriangleUp, "IndBuy"));
@@ -853,7 +861,7 @@ namespace NinjaTrader.Indicator
 		{
 			if(_sock!=null) 
 			{				
-				Log("OnTermination called, shutting down connection.",LogLevel.Information);
+				Log("Encog: OnTermination called, shutting down connection.",LogLevel.Information);
 				PerformGoodBye();
 			}
 		}
